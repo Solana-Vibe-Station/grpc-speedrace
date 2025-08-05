@@ -29,8 +29,8 @@ async fn main() -> Result<()> {
     info!("Endpoint A: {}", config.endpoint_a);
     info!("Endpoint B: {}", config.endpoint_b);
     
-    // Create the referee with a maximum of 5000 slots
-    let max_slots = 5000;
+    // Create the referee with a maximum of 1500 slots
+    let max_slots = 1500;
     let referee: SharedReferee = Arc::new(Mutex::new(Referee::new(max_slots)));
     
     // Create two subscription tasks with different configs

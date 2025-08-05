@@ -105,6 +105,8 @@ impl Referee {
             completed_races: total_races_complete,
             avg_stream_a_winning_margin_ms: avg_stream_a_winning_margin,
             avg_stream_b_winning_margin_ms: avg_stream_b_winning_margin,
+            stream_a_total_winning_margin,
+            stream_b_total_winning_margin,
         }
     }
 
@@ -129,17 +131,16 @@ impl Referee {
                 info!("Stream-B average winning margin: {}ms", summary.avg_stream_b_winning_margin_ms);
             }
             
-            // Calculate net advantage
-            if summary.stream_a_wins > summary.stream_b_wins {
-                let net_advantage = summary.avg_stream_a_winning_margin_ms as i128 - 
-                                  summary.avg_stream_b_winning_margin_ms as i128;
-                info!(">>> Stream-A is faster overall by approximately {}ms", net_advantage.abs());
-            } else if summary.stream_b_wins > summary.stream_a_wins {
-                let net_advantage = summary.avg_stream_b_winning_margin_ms as i128 - 
-                                  summary.avg_stream_a_winning_margin_ms as i128;
-                info!(">>> Stream-B is faster overall by approximately {}ms", net_advantage.abs());
+            // Calculate net advantage over all completed races
+            let stream_a_advantage = (summary.stream_a_total_winning_margin as i128) - (summary.stream_b_total_winning_margin as i128);
+            let avg_advantage_per_slot = stream_a_advantage as f64 / summary.completed_races as f64;
+            
+            if avg_advantage_per_slot > 0.0 {
+                info!(">>> Stream-A is faster overall by {:.2}ms per slot", avg_advantage_per_slot);
+            } else if avg_advantage_per_slot < 0.0 {
+                info!(">>> Stream-B is faster overall by {:.2}ms per slot", avg_advantage_per_slot.abs());
             } else {
-                info!(">>> Streams are tied in wins");
+                info!(">>> Streams are perfectly tied");
             }
         }
         info!("==================");
@@ -154,6 +155,8 @@ pub struct RaceSummary {
     pub completed_races: usize,
     pub avg_stream_a_winning_margin_ms: u128,
     pub avg_stream_b_winning_margin_ms: u128,
+    pub stream_a_total_winning_margin: u128,
+    pub stream_b_total_winning_margin: u128,
 }
 
 // Thread-safe wrapper for sharing between tasks
