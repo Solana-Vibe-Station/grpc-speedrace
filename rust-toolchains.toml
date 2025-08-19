@@ -1,0 +1,4 @@
+[toolchain]
+channel = "1.85.0"
+# Or use "stable" for latest stable
+# channel = "stable"
