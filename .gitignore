@@ -38,3 +38,4 @@ Thumbs.db
 # === Database files ===
 db/
 .env
+config.toml
