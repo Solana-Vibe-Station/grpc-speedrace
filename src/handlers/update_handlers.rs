@@ -35,7 +35,15 @@ impl UpdateHandlers {
         
         tokio::spawn(async move {
             let mut ref_guard = referee.lock().await;
-            ref_guard.report_slot(slot, stream_id, timestamp);
+            let should_continue = ref_guard.report_slot(slot, stream_id, timestamp);
+            
+            // If race is complete, exit the entire program
+            if !should_continue && ref_guard.is_complete() {
+                info!("Race complete! Maximum slots reached.");
+                ref_guard.print_summary();
+                drop(ref_guard);
+                std::process::exit(0);
+            }
         });
     }
 

@@ -1,42 +1,44 @@
-use std::env;
+use serde::{Deserialize, Serialize};
+use anyhow::Result;
+use std::fs;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub endpoint_a: String,
-    pub access_token_a: Option<String>,
-    pub endpoint_b: String,
-    pub access_token_b: Option<String>,
+    #[serde(default = "default_max_slots")]
+    pub max_slots: usize,
+    #[serde(default = "default_stop_at_max")]
+    pub stop_at_max: bool,
+    pub streams: Vec<StreamConfig>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StreamConfig {
+    pub name: String,
+    pub endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+}
+
+fn default_max_slots() -> usize {
+    360
+}
+
+fn default_stop_at_max() -> bool {
+    false
 }
 
 impl Config {
-    pub fn from_env() -> Self {
-        Self {
-            endpoint_a: env::var("GEYSER_ENDPOINT_A")
-                .unwrap_or_else(|_| "https://your-provider-endpoint-a".to_string()),
-            access_token_a: env::var("GEYSER_ACCESS_TOKEN_A").ok(),
-            endpoint_b: env::var("GEYSER_ENDPOINT_B")
-                .unwrap_or_else(|_| "https://your-provider-endpoint-b".to_string()),
-            access_token_b: env::var("GEYSER_ACCESS_TOKEN_B").ok(),
+    pub fn from_file() -> Result<Self> {
+        let content = fs::read_to_string("config.toml")
+            .map_err(|e| anyhow::anyhow!("Failed to read config.toml: {}", e))?;
+            
+        let config: Config = toml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse config.toml: {}", e))?;
+            
+        if config.streams.is_empty() {
+            return Err(anyhow::anyhow!("No streams configured in config.toml"));
         }
+        
+        Ok(config)
     }
-    
-    pub fn get_config_a(&self) -> SingleConfig {
-        SingleConfig {
-            endpoint: self.endpoint_a.clone(),
-            access_token: self.access_token_a.clone(),
-        }
-    }
-    
-    pub fn get_config_b(&self) -> SingleConfig {
-        SingleConfig {
-            endpoint: self.endpoint_b.clone(),
-            access_token: self.access_token_b.clone(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct SingleConfig {
-    pub endpoint: String,
-    pub access_token: Option<String>,
 }

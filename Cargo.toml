@@ -31,5 +31,7 @@ tracing-subscriber = "0.3"
 # Base58 encoding for Solana addresses
 bs58 = "0.5"
 
-# Environment variables
-dotenv = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+toml = "0.8"

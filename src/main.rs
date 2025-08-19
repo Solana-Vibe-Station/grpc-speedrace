@@ -13,40 +13,37 @@ mod subscription;
 mod referee;
 
 use client::GrpcClient;
-use config::{Config, SingleConfig};
+use config::{Config, StreamConfig};
 use subscription::SubscriptionManager;
 use referee::{Referee, SharedReferee};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize environment and logging
-    dotenv::dotenv().ok();
+    // Initialize logging
     tracing_subscriber::fmt::init();
     
-    let config = Config::from_env();
+    let config = Config::from_file()?;
     
-    info!("Starting dual gRPC subscription comparison");
-    info!("Endpoint A: {}", config.endpoint_a);
-    info!("Endpoint B: {}", config.endpoint_b);
+    info!("Starting gRPC subscription comparison with {} streams", config.streams.len());
+    for (i, stream) in config.streams.iter().enumerate() {
+        info!("Stream {}: {} - {}", i + 1, stream.name, stream.endpoint);
+    }
     
-    // Create the referee with a maximum of 1500 slots
-    let max_slots = 1500;
-    let referee: SharedReferee = Arc::new(Mutex::new(Referee::new(max_slots)));
+    // Create the referee with configuration from env
+    let referee: SharedReferee = Arc::new(Mutex::new(Referee::new(config.max_slots, config.stop_at_max)));
     
-    // Create two subscription tasks with different configs
-    let config_a = config.get_config_a();
-    let config_b = config.get_config_b();
+    info!("Race configuration:");
+    info!("  Max slots: {}", config.max_slots);
+    info!("  Stop at max: {}", config.stop_at_max);
     
-    let subscription1: JoinHandle<Result<()>> = tokio::spawn(run_subscription(
-        config_a, 
-        "Stream-A".to_string(),
-        referee.clone()
-    ));
-    let subscription2: JoinHandle<Result<()>> = tokio::spawn(run_subscription(
-        config_b, 
-        "Stream-B".to_string(),
-        referee.clone()
-    ));
+    // Create subscription tasks for all streams
+    let mut subscriptions: Vec<JoinHandle<Result<()>>> = Vec::new();
+    
+    for stream_config in config.streams {
+        let referee_clone = referee.clone();
+        let subscription = tokio::spawn(run_subscription(stream_config, referee_clone));
+        subscriptions.push(subscription);
+    }
     
     // Spawn a task to periodically print summaries
     let summary_referee = referee.clone();
@@ -59,24 +56,23 @@ async fn main() -> Result<()> {
         }
     });
     
-    // Wait for both subscriptions (they should run indefinitely)
-    let (result1, result2) = tokio::join!(subscription1, subscription2);
+    // Wait for all subscriptions
+    let results = futures::future::join_all(subscriptions).await;
     
     // Handle results
-    if let Err(e) = result1 {
-        error!("Stream-A task failed: {}", e);
-    }
-    if let Err(e) = result2 {
-        error!("Stream-B task failed: {}", e);
+    for (i, result) in results.into_iter().enumerate() {
+        if let Err(e) = result {
+            error!("Stream {} task failed: {}", i + 1, e);
+        }
     }
     
     Ok(())
 }
 
-async fn run_subscription(config: SingleConfig, stream_name: String, referee: SharedReferee) -> Result<()> {
+async fn run_subscription(config: StreamConfig, referee: SharedReferee) -> Result<()> {
     retry(ExponentialBackoff::default(), move || {
         let config = config.clone();
-        let stream_name = stream_name.clone();
+        let stream_name = config.name.clone();
         let stream_name_for_error = stream_name.clone();
         let referee = referee.clone();
         

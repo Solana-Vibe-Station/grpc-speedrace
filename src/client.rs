@@ -1,14 +1,14 @@
 use anyhow::Result;
 use tonic::transport::ClientTlsConfig;
 use yellowstone_grpc_client::GeyserGrpcClient;
-use crate::config::SingleConfig;
+use crate::config::StreamConfig;
 
 pub struct GrpcClient {
-    config: SingleConfig,
+    config: StreamConfig,
 }
 
 impl GrpcClient {
-    pub fn new(config: SingleConfig) -> Self {
+    pub fn new(config: StreamConfig) -> Self {
         Self { config }
     }
     

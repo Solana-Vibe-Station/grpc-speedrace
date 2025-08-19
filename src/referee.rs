@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
@@ -8,45 +8,93 @@ pub struct SlotResult {
     pub slot: u64,
     pub winner: String,
     pub winner_timestamp: u128,
-    pub loser_timestamp: Option<u128>,
+    pub finish_times: HashMap<String, u128>, // All finish times including winner
+}
+
+#[derive(Debug)]
+pub struct StreamMetrics {
+    pub name: String,
+    pub wins: usize,
+    pub total_races: usize,
+    pub win_rate: f64,
+    pub median_time_behind_ms: f64,
+    pub p90_time_behind_ms: f64,  // 90th percentile (worst 10%)
+    pub p95_time_behind_ms: f64,  // 95th percentile (worst 5%)
+    pub p99_time_behind_ms: f64,  // 99th percentile (worst 1%)
 }
 
 pub struct Referee {
     max_slots: usize,
     results: VecDeque<SlotResult>,
+    stream_names: Vec<String>,
+    stop_at_max: bool,
 }
 
 impl Referee {
-    pub fn new(max_slots: usize) -> Self {
+    pub fn new(max_slots: usize, stop_at_max: bool) -> Self {
         Self {
             max_slots,
             results: VecDeque::with_capacity(max_slots),
+            stream_names: Vec::new(),
+            stop_at_max,
         }
     }
+    
+    pub fn is_complete(&self) -> bool {
+        self.stop_at_max && self.results.len() >= self.max_slots
+    }
 
-    pub fn report_slot(&mut self, slot: u64, stream_id: String, timestamp: u128) {
+    pub fn report_slot(&mut self, slot: u64, stream_id: String, timestamp: u128) -> bool {
+        // If we're at max capacity and should stop, return false to signal completion
+        if self.stop_at_max && self.results.len() >= self.max_slots {
+            // Check if this is a new slot (not already in results)
+            if !self.results.iter().any(|r| r.slot == slot) {
+                return false;
+            }
+        }
+        
+        // Track unique stream names
+        if !self.stream_names.contains(&stream_id) {
+            self.stream_names.push(stream_id.clone());
+        }
+        
         // Check if this slot already exists
         if let Some(existing) = self.results.iter_mut().find(|r| r.slot == slot) {
-            // This is the loser
-            existing.loser_timestamp = Some(timestamp);
-            let time_diff = timestamp.saturating_sub(existing.winner_timestamp);
+            // Add this stream's finish time
+            existing.finish_times.insert(stream_id.clone(), timestamp);
             
-            info!(
-                "Slot {} race complete! Winner: {} ({}ms), Loser: {} ({}ms), Difference: {}ms",
-                slot,
-                existing.winner,
-                existing.winner_timestamp,
-                stream_id,
-                timestamp,
-                time_diff
-            );
+            // Log based on number of streams
+            if self.stream_names.len() == 2 {
+                // Two-stream race logging (keep existing behavior)
+                let time_diff = timestamp.saturating_sub(existing.winner_timestamp);
+                info!(
+                    "Slot {} race complete! Winner: {} ({}ms), Loser: {} ({}ms), Difference: {}ms",
+                    slot,
+                    existing.winner,
+                    existing.winner_timestamp,
+                    stream_id,
+                    timestamp,
+                    time_diff
+                );
+            } else {
+                // Multi-stream race logging
+                let position = existing.finish_times.len();
+                let time_behind = timestamp.saturating_sub(existing.winner_timestamp);
+                info!(
+                    "Slot {} - Position {}: {} ({}ms, +{}ms behind winner)",
+                    slot, position, stream_id, timestamp, time_behind
+                );
+            }
         } else {
             // This is the first report for this slot (winner)
+            let mut finish_times = HashMap::new();
+            finish_times.insert(stream_id.clone(), timestamp);
+            
             let result = SlotResult {
                 slot,
                 winner: stream_id.clone(),
                 winner_timestamp: timestamp,
-                loser_timestamp: None,
+                finish_times,
             };
             
             info!(
@@ -57,106 +105,151 @@ impl Referee {
             // Add to results
             self.results.push_back(result);
             
-            // Remove oldest if we exceed max_slots
-            if self.results.len() > self.max_slots {
+            // Remove oldest if we exceed max_slots (only if not stopping at max)
+            if !self.stop_at_max && self.results.len() > self.max_slots {
                 self.results.pop_front();
             }
         }
-    }
-
-    pub fn get_summary(&self) -> RaceSummary {
-        let mut stream_a_wins = 0;
-        let mut stream_b_wins = 0;
-        let mut total_races_complete = 0;
-        let mut stream_a_total_winning_margin = 0u128;
-        let mut stream_b_total_winning_margin = 0u128;
         
-        for result in &self.results {
-            if let Some(loser_ts) = result.loser_timestamp {
-                total_races_complete += 1;
-                let time_diff = loser_ts.saturating_sub(result.winner_timestamp);
-                
-                if result.winner.contains("A") {
-                    stream_a_wins += 1;
-                    stream_a_total_winning_margin += time_diff;
-                } else if result.winner.contains("B") {
-                    stream_b_wins += 1;
-                    stream_b_total_winning_margin += time_diff;
-                }
-            }
-        }
-        
-        let avg_stream_a_winning_margin = if stream_a_wins > 0 {
-            stream_a_total_winning_margin / stream_a_wins as u128
-        } else {
-            0
-        };
-        
-        let avg_stream_b_winning_margin = if stream_b_wins > 0 {
-            stream_b_total_winning_margin / stream_b_wins as u128
-        } else {
-            0
-        };
-        
-        RaceSummary {
-            stream_a_wins,
-            stream_b_wins,
-            total_slots: self.results.len(),
-            completed_races: total_races_complete,
-            avg_stream_a_winning_margin_ms: avg_stream_a_winning_margin,
-            avg_stream_b_winning_margin_ms: avg_stream_b_winning_margin,
-            stream_a_total_winning_margin,
-            stream_b_total_winning_margin,
-        }
+        true // Continue processing
     }
 
     pub fn print_summary(&self) {
-        let summary = self.get_summary();
         info!("=== RACE SUMMARY ===");
-        info!("Total slots tracked: {}", summary.total_slots);
-        info!("Completed races: {}", summary.completed_races);
-        info!("Stream-A wins: {}", summary.stream_a_wins);
-        info!("Stream-B wins: {}", summary.stream_b_wins);
+        info!("Total slots tracked: {}", self.results.len());
         
-        if summary.completed_races > 0 {
-            let win_rate_a = (summary.stream_a_wins as f64 / summary.completed_races as f64) * 100.0;
-            let win_rate_b = (summary.stream_b_wins as f64 / summary.completed_races as f64) * 100.0;
-            info!("Stream-A win rate: {:.1}%", win_rate_a);
-            info!("Stream-B win rate: {:.1}%", win_rate_b);
-            
-            if summary.stream_a_wins > 0 {
-                info!("Stream-A average winning margin: {}ms", summary.avg_stream_a_winning_margin_ms);
-            }
-            if summary.stream_b_wins > 0 {
-                info!("Stream-B average winning margin: {}ms", summary.avg_stream_b_winning_margin_ms);
-            }
-            
-            // Calculate net advantage over all completed races
-            let stream_a_advantage = (summary.stream_a_total_winning_margin as i128) - (summary.stream_b_total_winning_margin as i128);
-            let avg_advantage_per_slot = stream_a_advantage as f64 / summary.completed_races as f64;
-            
-            if avg_advantage_per_slot > 0.0 {
-                info!(">>> Stream-A is faster overall by {:.2}ms per slot", avg_advantage_per_slot);
-            } else if avg_advantage_per_slot < 0.0 {
-                info!(">>> Stream-B is faster overall by {:.2}ms per slot", avg_advantage_per_slot.abs());
-            } else {
-                info!(">>> Streams are perfectly tied");
-            }
+        if self.stream_names.is_empty() {
+            info!("No streams have reported yet");
+            info!("==================");
+            return;
         }
+        
+        // Calculate comprehensive metrics for all streams
+        let metrics = self.calculate_stream_metrics();
+        
+        // Count completed races
+        let completed_races = self.results.iter()
+            .filter(|r| r.finish_times.len() == self.stream_names.len())
+            .count();
+        
+        info!("Completed races (all {} streams reported): {}", self.stream_names.len(), completed_races);
+        info!("Partial results included: {}", self.results.len() - completed_races);
+        
+        // Sort streams by median time behind (ascending - fastest first)
+        let mut sorted_metrics = metrics;
+        sorted_metrics.sort_by(|a, b| a.median_time_behind_ms.partial_cmp(&b.median_time_behind_ms).unwrap());
+        
+        info!("");
+        info!("Stream Performance Metrics:");
+        info!("");
+        
+        for (rank, metric) in sorted_metrics.iter().enumerate() {
+            info!("{}. {} - Wins: {}/{} ({:.1}%)", 
+                rank + 1, metric.name, metric.wins, metric.total_races, metric.win_rate);
+            info!("   Median time behind: {:.0}ms", metric.median_time_behind_ms);
+            info!("   Worst-case latencies: P90: {:.0}ms, P95: {:.0}ms, P99: {:.0}ms",
+                metric.p90_time_behind_ms, metric.p95_time_behind_ms, metric.p99_time_behind_ms);
+            info!("");
+        }
+        
+        // Overall winner
+        if let Some(leader) = sorted_metrics.first() {
+            info!(">>> {} is the fastest overall", leader.name);
+        }
+        
         info!("==================");
     }
-}
-
-#[derive(Debug)]
-pub struct RaceSummary {
-    pub stream_a_wins: usize,
-    pub stream_b_wins: usize,
-    pub total_slots: usize,
-    pub completed_races: usize,
-    pub avg_stream_a_winning_margin_ms: u128,
-    pub avg_stream_b_winning_margin_ms: u128,
-    pub stream_a_total_winning_margin: u128,
-    pub stream_b_total_winning_margin: u128,
+    
+    fn calculate_stream_metrics(&self) -> Vec<StreamMetrics> {
+        let mut metrics = Vec::new();
+        
+        for stream_name in &self.stream_names {
+            let mut times_behind_winner: Vec<u64> = Vec::new();
+            let mut wins = 0;
+            let mut races_participated = 0;
+            
+            for result in &self.results {
+                if let Some(&my_time) = result.finish_times.get(stream_name) {
+                    races_participated += 1;
+                    
+                    // Calculate time behind winner (0 if we won)
+                    let time_behind = my_time.saturating_sub(result.winner_timestamp) as u64;
+                    times_behind_winner.push(time_behind);
+                    
+                    if result.winner == *stream_name {
+                        wins += 1;
+                    }
+                }
+            }
+            
+            if races_participated == 0 {
+                continue;
+            }
+            
+            // Calculate median
+            let median_time_behind = self.calculate_median(&times_behind_winner);
+            
+            // Calculate percentiles
+            let (p90, p95, p99) = self.calculate_percentiles(&times_behind_winner);
+            
+            metrics.push(StreamMetrics {
+                name: stream_name.clone(),
+                wins,
+                total_races: races_participated,
+                win_rate: (wins as f64 / races_participated as f64) * 100.0,
+                median_time_behind_ms: median_time_behind,
+                p90_time_behind_ms: p90,
+                p95_time_behind_ms: p95,
+                p99_time_behind_ms: p99,
+            });
+        }
+        
+        // Sort by median time behind (ascending - fastest first)
+        metrics.sort_by(|a, b| a.median_time_behind_ms.partial_cmp(&b.median_time_behind_ms).unwrap());
+        
+        metrics
+    }
+    
+    fn calculate_median(&self, values: &[u64]) -> f64 {
+        if values.is_empty() {
+            return 0.0;
+        }
+        
+        let mut sorted = values.to_vec();
+        sorted.sort();
+        
+        let len = sorted.len();
+        if len % 2 == 0 {
+            (sorted[len / 2 - 1] + sorted[len / 2]) as f64 / 2.0
+        } else {
+            sorted[len / 2] as f64
+        }
+    }
+    
+    fn calculate_percentiles(&self, values: &[u64]) -> (f64, f64, f64) {
+        if values.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
+        
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable_by(|a, b| b.cmp(a)); // Sort descending for worst times
+        
+        let len = sorted.len();
+        
+        // P90 = 90th percentile (worst 10%)
+        let p90_idx = ((len as f64 * 0.10).ceil() as usize).saturating_sub(1);
+        let p90 = sorted[p90_idx] as f64;
+        
+        // P95 = 95th percentile (worst 5%)
+        let p95_idx = ((len as f64 * 0.05).ceil() as usize).saturating_sub(1);
+        let p95 = sorted[p95_idx] as f64;
+        
+        // P99 = 99th percentile (worst 1%)
+        let p99_idx = ((len as f64 * 0.01).ceil() as usize).saturating_sub(1);
+        let p99 = sorted[p99_idx] as f64;
+        
+        (p90, p95, p99)
+    }
 }
 
 // Thread-safe wrapper for sharing between tasks
