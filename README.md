@@ -65,9 +65,10 @@ cargo run --release
 
 ### Real-time Updates
 ```
-[Provider A] Slot 361180142 first received by Provider A at 1755638913716ms
-[Provider B] Slot 361180142 - Position 2: Provider B (1755638913717ms, +1ms behind winner)
-[Provider C] Slot 361180142 - Position 3: Provider C (1755638913720ms, +4ms behind winner)
+[2025-01-16T14:23:45Z INFO] Slot 361180142 - Position 1/3: Provider A (1755638913716000000ns, WINNER)
+[2025-01-16T14:23:45Z INFO] Slot 361180142 - Position 2/3: Provider B (1755638913717000000ns, +1.000ms)
+[2025-01-16T14:23:45Z INFO] Slot 361180142 - Position 3/3: Provider C (1755638913720000000ns, +4.000ms)
+[2025-01-16T14:23:45Z INFO] Slot 361180142 race complete! All 3 streams reported. Winner: Provider A (4.000ms ahead of last)
 ```
 
 ### Race Summary (every 30 seconds)
