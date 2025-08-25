@@ -25,7 +25,7 @@ pub struct StreamMetrics {
 
 pub struct Referee {
     max_slots: usize,
-    results: VecDeque<SlotResult>,
+    pub results: VecDeque<SlotResult>,
     stream_names: Vec<String>,
     stop_at_max: bool,
 }
@@ -66,23 +66,25 @@ impl Referee {
             // Log based on number of streams
             if self.stream_names.len() == 2 {
                 // Two-stream race logging (keep existing behavior)
-                let time_diff = timestamp.saturating_sub(existing.winner_timestamp);
+                let time_diff_ns = timestamp.saturating_sub(existing.winner_timestamp);
+                let time_diff_ms = time_diff_ns as f64 / 1_000_000.0;
                 info!(
-                    "Slot {} race complete! Winner: {} ({}ms), Loser: {} ({}ms), Difference: {}ms",
+                    "Slot {} race complete! Winner: {} ({}ns), Loser: {} ({}ns), Difference: {:.3}ms",
                     slot,
                     existing.winner,
                     existing.winner_timestamp,
                     stream_id,
                     timestamp,
-                    time_diff
+                    time_diff_ms
                 );
             } else {
                 // Multi-stream race logging
                 let position = existing.finish_times.len();
-                let time_behind = timestamp.saturating_sub(existing.winner_timestamp);
+                let time_behind_ns = timestamp.saturating_sub(existing.winner_timestamp);
+                let time_behind_ms = time_behind_ns as f64 / 1_000_000.0;
                 info!(
-                    "Slot {} - Position {}: {} ({}ms, +{}ms behind winner)",
-                    slot, position, stream_id, timestamp, time_behind
+                    "Slot {} - Position {}: {} ({}ns, +{:.3}ms behind winner)",
+                    slot, position, stream_id, timestamp, time_behind_ms
                 );
             }
         } else {
@@ -98,8 +100,8 @@ impl Referee {
             };
             
             info!(
-                "Slot {} first received by {} at {}ms",
-                slot, stream_id, timestamp
+                "Slot {} first received by {} at {}ns ({}ms)",
+                slot, stream_id, timestamp, timestamp / 1_000_000
             );
             
             // Add to results
@@ -146,8 +148,8 @@ impl Referee {
         for (rank, metric) in sorted_metrics.iter().enumerate() {
             info!("{}. {} - Wins: {}/{} ({:.1}%)", 
                 rank + 1, metric.name, metric.wins, metric.total_races, metric.win_rate);
-            info!("   Median time behind: {:.0}ms", metric.median_time_behind_ms);
-            info!("   Worst-case latencies: P90: {:.0}ms, P95: {:.0}ms, P99: {:.0}ms",
+            info!("   Median time behind: {:.3}ms", metric.median_time_behind_ms);
+            info!("   Worst-case latencies: P90: {:.3}ms, P95: {:.3}ms, P99: {:.3}ms",
                 metric.p90_time_behind_ms, metric.p95_time_behind_ms, metric.p99_time_behind_ms);
             info!("");
         }
@@ -164,7 +166,7 @@ impl Referee {
         let mut metrics = Vec::new();
         
         for stream_name in &self.stream_names {
-            let mut times_behind_winner: Vec<u64> = Vec::new();
+            let mut times_behind_winner_ns: Vec<u128> = Vec::new();
             let mut wins = 0;
             let mut races_participated = 0;
             
@@ -172,9 +174,9 @@ impl Referee {
                 if let Some(&my_time) = result.finish_times.get(stream_name) {
                     races_participated += 1;
                     
-                    // Calculate time behind winner (0 if we won)
-                    let time_behind = my_time.saturating_sub(result.winner_timestamp) as u64;
-                    times_behind_winner.push(time_behind);
+                    // Calculate time behind winner in nanoseconds (0 if we won)
+                    let time_behind_ns = my_time.saturating_sub(result.winner_timestamp);
+                    times_behind_winner_ns.push(time_behind_ns);
                     
                     if result.winner == *stream_name {
                         wins += 1;
@@ -186,11 +188,16 @@ impl Referee {
                 continue;
             }
             
-            // Calculate median
-            let median_time_behind = self.calculate_median(&times_behind_winner);
+            // Convert to milliseconds for display
+            let times_behind_ms: Vec<f64> = times_behind_winner_ns.iter()
+                .map(|&ns| ns as f64 / 1_000_000.0)
+                .collect();
             
-            // Calculate percentiles
-            let (p90, p95, p99) = self.calculate_percentiles(&times_behind_winner);
+            // Calculate median in milliseconds
+            let median_time_behind = self.calculate_median(&times_behind_ms);
+            
+            // Calculate percentiles in milliseconds
+            let (p90, p95, p99) = self.calculate_percentiles(&times_behind_ms);
             
             metrics.push(StreamMetrics {
                 name: stream_name.clone(),
@@ -210,43 +217,43 @@ impl Referee {
         metrics
     }
     
-    fn calculate_median(&self, values: &[u64]) -> f64 {
+    fn calculate_median(&self, values: &[f64]) -> f64 {
         if values.is_empty() {
             return 0.0;
         }
         
         let mut sorted = values.to_vec();
-        sorted.sort();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         
         let len = sorted.len();
         if len % 2 == 0 {
-            (sorted[len / 2 - 1] + sorted[len / 2]) as f64 / 2.0
+            (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0
         } else {
-            sorted[len / 2] as f64
+            sorted[len / 2]
         }
     }
     
-    fn calculate_percentiles(&self, values: &[u64]) -> (f64, f64, f64) {
+    fn calculate_percentiles(&self, values: &[f64]) -> (f64, f64, f64) {
         if values.is_empty() {
             return (0.0, 0.0, 0.0);
         }
         
         let mut sorted = values.to_vec();
-        sorted.sort_unstable_by(|a, b| b.cmp(a)); // Sort descending for worst times
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap()); // Sort descending for worst times
         
         let len = sorted.len();
         
         // P90 = 90th percentile (worst 10%)
         let p90_idx = ((len as f64 * 0.10).ceil() as usize).saturating_sub(1);
-        let p90 = sorted[p90_idx] as f64;
+        let p90 = sorted[p90_idx];
         
         // P95 = 95th percentile (worst 5%)
         let p95_idx = ((len as f64 * 0.05).ceil() as usize).saturating_sub(1);
-        let p95 = sorted[p95_idx] as f64;
+        let p95 = sorted[p95_idx];
         
         // P99 = 99th percentile (worst 1%)
         let p99_idx = ((len as f64 * 0.01).ceil() as usize).saturating_sub(1);
-        let p99 = sorted[p99_idx] as f64;
+        let p99 = sorted[p99_idx];
         
         (p90, p95, p99)
     }

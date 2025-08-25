@@ -22,11 +22,12 @@ impl MessageHandler {
     pub async fn handle_message(
         &mut self,
         msg: SubscribeUpdate,
+        receive_timestamp: u128,
         subscribe_tx: &mut (impl SinkExt<SubscribeRequest, Error = futures::channel::mpsc::SendError> + Unpin),
     ) -> Result<()> {
         match msg.update_oneof {
             Some(subscribe_update::UpdateOneof::Slot(slot_update)) => {
-                self.update_handlers.handle_slot_update(slot_update);
+                self.update_handlers.handle_slot_update(slot_update, receive_timestamp);
             }
             Some(subscribe_update::UpdateOneof::Account(account_update)) => {
                 self.update_handlers.handle_account_update(account_update);

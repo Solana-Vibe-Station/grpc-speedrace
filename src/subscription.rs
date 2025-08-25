@@ -3,22 +3,26 @@ use tokio_stream::StreamExt;
 use tracing::{error, info};
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::*;
+use std::time::Instant;
 
 use crate::handlers::MessageHandler;
 use crate::referee::SharedReferee;
+use crate::SharedClock;
 
 pub struct SubscriptionManager<T: tonic::service::Interceptor> {
     client: GeyserGrpcClient<T>,
     handler: MessageHandler,
     stream_id: String,
+    shared_clock: SharedClock,
 }
 
 impl<T: tonic::service::Interceptor> SubscriptionManager<T> {
-    pub fn new(client: GeyserGrpcClient<T>, stream_id: String, referee: SharedReferee) -> Self {
+    pub fn new(client: GeyserGrpcClient<T>, stream_id: String, referee: SharedReferee, shared_clock: SharedClock) -> Self {
         Self {
             client,
             handler: MessageHandler::new(stream_id.clone(), referee),
             stream_id,
+            shared_clock,
         }
     }
 
@@ -44,9 +48,14 @@ impl<T: tonic::service::Interceptor> SubscriptionManager<T> {
         info!("[{}] Subscribed to slot updates, waiting for messages...", self.stream_id);
         
         while let Some(message) = stream.next().await {
+            // Capture timestamp using high-resolution Instant
+            // This gives us true nanosecond precision
+            let receive_instant = Instant::now();
+            let receive_timestamp = receive_instant.duration_since(*self.shared_clock).as_nanos() as u128;
+            
             match message {
                 Ok(msg) => {
-                    if let Err(e) = self.handler.handle_message(msg, &mut subscribe_tx).await {
+                    if let Err(e) = self.handler.handle_message(msg, receive_timestamp, &mut subscribe_tx).await {
                         error!("[{}] Error handling message: {}", self.stream_id, e);
                         break;
                     }

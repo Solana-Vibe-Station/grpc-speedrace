@@ -5,6 +5,7 @@ use tracing::{error, info};
 use tokio::task::JoinHandle;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use std::time::Instant;
 
 mod client;
 mod config;
@@ -16,6 +17,9 @@ use client::GrpcClient;
 use config::{Config, StreamConfig};
 use subscription::SubscriptionManager;
 use referee::{Referee, SharedReferee};
+
+// Shared clock reference for all streams - ensures consistent timing
+pub type SharedClock = Arc<Instant>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,6 +36,10 @@ async fn main() -> Result<()> {
     // Create the referee with configuration from env
     let referee: SharedReferee = Arc::new(Mutex::new(Referee::new(config.max_slots, config.stop_at_max)));
     
+    // Create a shared high-resolution clock reference
+    // All streams will measure time from this same starting point
+    let shared_clock: SharedClock = Arc::new(Instant::now());
+    
     info!("Race configuration:");
     info!("  Max slots: {}", config.max_slots);
     info!("  Stop at max: {}", config.stop_at_max);
@@ -41,7 +49,8 @@ async fn main() -> Result<()> {
     
     for stream_config in config.streams {
         let referee_clone = referee.clone();
-        let subscription = tokio::spawn(run_subscription(stream_config, referee_clone));
+        let clock_clone = shared_clock.clone();
+        let subscription = tokio::spawn(run_subscription(stream_config, referee_clone, clock_clone));
         subscriptions.push(subscription);
     }
     
@@ -69,12 +78,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_subscription(config: StreamConfig, referee: SharedReferee) -> Result<()> {
+async fn run_subscription(config: StreamConfig, referee: SharedReferee, clock: SharedClock) -> Result<()> {
     retry(ExponentialBackoff::default(), move || {
         let config = config.clone();
         let stream_name = config.name.clone();
         let stream_name_for_error = stream_name.clone();
         let referee = referee.clone();
+        let clock = clock.clone();
         
         async move {
             info!("[{}] Connecting to gRPC endpoint: {}", stream_name, config.endpoint);
@@ -87,8 +97,8 @@ async fn run_subscription(config: StreamConfig, referee: SharedReferee) -> Resul
                 
             info!("[{}] Successfully connected to Yellowstone gRPC", stream_name);
             
-            // Run the subscription
-            let mut subscription_manager = SubscriptionManager::new(client, stream_name.clone(), referee);
+            // Run the subscription with shared clock
+            let mut subscription_manager = SubscriptionManager::new(client, stream_name.clone(), referee, clock);
             subscription_manager
                 .run()
                 .await

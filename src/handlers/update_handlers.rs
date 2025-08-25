@@ -12,30 +12,28 @@ impl UpdateHandlers {
         Self { stream_id, referee }
     }
 
-    pub fn handle_slot_update(&self, slot_update: SubscribeUpdateSlot) {
-        // Get current timestamp for comparison between streams
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
+    pub fn handle_slot_update(&self, slot_update: SubscribeUpdateSlot, receive_timestamp: u128) {
+        // Convert nanoseconds to milliseconds for display
+        let timestamp_ms = receive_timestamp / 1_000_000;
         
         info!(
-            "[{}] Slot update: slot={}, parent={}, status={:?}, received_at={}ms",
+            "[{}] Slot update: slot={}, parent={}, status={:?}, received_at={}ms ({}ns)",
             self.stream_id,
             slot_update.slot,
             slot_update.parent.unwrap_or(0),
             slot_update.status(),
-            timestamp
+            timestamp_ms,
+            receive_timestamp
         );
         
-        // Report to referee
+        // Report to referee with the original nanosecond timestamp
         let referee = self.referee.clone();
         let stream_id = self.stream_id.clone();
         let slot = slot_update.slot;
         
         tokio::spawn(async move {
             let mut ref_guard = referee.lock().await;
-            let should_continue = ref_guard.report_slot(slot, stream_id, timestamp);
+            let should_continue = ref_guard.report_slot(slot, stream_id, receive_timestamp);
             
             // If race is complete, exit the entire program
             if !should_continue && ref_guard.is_complete() {
