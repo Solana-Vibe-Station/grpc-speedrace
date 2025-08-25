@@ -26,23 +26,13 @@ impl UpdateHandlers {
             receive_timestamp
         );
         
-        // Report to referee with the original nanosecond timestamp
-        let referee = self.referee.clone();
-        let stream_id = self.stream_id.clone();
-        let slot = slot_update.slot;
-        
-        tokio::spawn(async move {
-            let mut ref_guard = referee.lock().await;
-            let should_continue = ref_guard.report_slot(slot, stream_id, receive_timestamp);
-            
-            // If race is complete, exit the entire program
-            if !should_continue && ref_guard.is_complete() {
-                info!("Race complete! Maximum slots reached.");
-                ref_guard.print_summary();
-                drop(ref_guard);
-                std::process::exit(0);
-            }
-        });
+        // Non-blocking send to the event channel
+        // No more tokio::spawn or mutex lock!
+        self.referee.send_slot(
+            slot_update.slot,
+            self.stream_id.clone(),
+            receive_timestamp
+        );
     }
 
     pub fn handle_account_update(&self, account_update: SubscribeUpdateAccount) {

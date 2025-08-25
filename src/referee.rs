@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, RwLock};
 use tracing::info;
 
 #[derive(Debug, Clone)]
@@ -23,68 +23,107 @@ pub struct StreamMetrics {
     pub p99_time_behind_ms: f64,  // 99th percentile (worst 1%)
 }
 
+// Event types for the channel
+#[derive(Debug)]
+pub enum RaceEvent {
+    SlotReport { 
+        slot: u64, 
+        stream_id: String, 
+        timestamp: u128 
+    },
+}
+
+// Inner state that needs to be mutable
+struct RefereeState {
+    results: VecDeque<SlotResult>,
+    stream_names: Vec<String>,
+}
+
 pub struct Referee {
     max_slots: usize,
-    pub results: VecDeque<SlotResult>,
-    stream_names: Vec<String>,
     stop_at_max: bool,
+    state: Arc<RwLock<RefereeState>>,
+    event_tx: mpsc::UnboundedSender<RaceEvent>,
 }
 
 impl Referee {
-    pub fn new(max_slots: usize, stop_at_max: bool) -> Self {
-        Self {
-            max_slots,
+    pub fn new(max_slots: usize, stop_at_max: bool) -> (Arc<Self>, mpsc::UnboundedReceiver<RaceEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        
+        let state = Arc::new(RwLock::new(RefereeState {
             results: VecDeque::with_capacity(max_slots),
             stream_names: Vec::new(),
+        }));
+        
+        let referee = Arc::new(Self {
+            max_slots,
             stop_at_max,
-        }
+            state,
+            event_tx: tx,
+        });
+        
+        (referee, rx)
     }
     
-    pub fn is_complete(&self) -> bool {
-        self.stop_at_max && self.results.len() >= self.max_slots
+    pub async fn is_complete(&self) -> bool {
+        let state = self.state.read().await;
+        self.stop_at_max && state.results.len() >= self.max_slots
+    }
+    
+    // Non-blocking send method for streams to report slots
+    pub fn send_slot(&self, slot: u64, stream_id: String, timestamp: u128) {
+        let _ = self.event_tx.send(RaceEvent::SlotReport { slot, stream_id, timestamp });
     }
 
-    pub fn report_slot(&mut self, slot: u64, stream_id: String, timestamp: u128) -> bool {
+    // Process a slot report - called by the event processor
+    pub async fn process_slot_report(&self, slot: u64, stream_id: String, timestamp: u128) -> bool {
+        let mut state = self.state.write().await;
+        
         // If we're at max capacity and should stop, return false to signal completion
-        if self.stop_at_max && self.results.len() >= self.max_slots {
+        if self.stop_at_max && state.results.len() >= self.max_slots {
             // Check if this is a new slot (not already in results)
-            if !self.results.iter().any(|r| r.slot == slot) {
+            if !state.results.iter().any(|r| r.slot == slot) {
                 return false;
             }
         }
         
         // Track unique stream names
-        if !self.stream_names.contains(&stream_id) {
-            self.stream_names.push(stream_id.clone());
+        if !state.stream_names.contains(&stream_id) {
+            state.stream_names.push(stream_id.clone());
         }
         
+        // Get the number of streams before we start borrowing results
+        let num_streams = state.stream_names.len();
+        
         // Check if this slot already exists
-        if let Some(existing) = self.results.iter_mut().find(|r| r.slot == slot) {
+        if let Some(existing) = state.results.iter_mut().find(|r| r.slot == slot) {
             // Add this stream's finish time
+            let position = existing.finish_times.len() + 1; // +1 because we haven't inserted yet
             existing.finish_times.insert(stream_id.clone(), timestamp);
             
-            // Log based on number of streams
-            if self.stream_names.len() == 2 {
-                // Two-stream race logging (keep existing behavior)
-                let time_diff_ns = timestamp.saturating_sub(existing.winner_timestamp);
-                let time_diff_ms = time_diff_ns as f64 / 1_000_000.0;
+            // Calculate time behind winner
+            let time_behind_ns = timestamp.saturating_sub(existing.winner_timestamp);
+            let time_behind_ms = time_behind_ns as f64 / 1_000_000.0;
+            
+            // Unified logging format
+            info!(
+                "Slot {} - Position {}/{}: {} ({}ns, +{:.3}ms)",
+                slot,
+                position,
+                num_streams,
+                stream_id,
+                timestamp,
+                time_behind_ms
+            );
+            
+            // If all streams have reported, log race completion
+            if existing.finish_times.len() == num_streams {
                 info!(
-                    "Slot {} race complete! Winner: {} ({}ns), Loser: {} ({}ns), Difference: {:.3}ms",
+                    "Slot {} race complete! All {} streams reported. Winner: {} ({:.3}ms ahead of last)",
                     slot,
+                    num_streams,
                     existing.winner,
-                    existing.winner_timestamp,
-                    stream_id,
-                    timestamp,
-                    time_diff_ms
-                );
-            } else {
-                // Multi-stream race logging
-                let position = existing.finish_times.len();
-                let time_behind_ns = timestamp.saturating_sub(existing.winner_timestamp);
-                let time_behind_ms = time_behind_ns as f64 / 1_000_000.0;
-                info!(
-                    "Slot {} - Position {}: {} ({}ns, +{:.3}ms behind winner)",
-                    slot, position, stream_id, timestamp, time_behind_ms
+                    time_behind_ms
                 );
             }
         } else {
@@ -99,43 +138,49 @@ impl Referee {
                 finish_times,
             };
             
+            // Unified logging format for winner
             info!(
-                "Slot {} first received by {} at {}ns ({}ms)",
-                slot, stream_id, timestamp, timestamp / 1_000_000
+                "Slot {} - Position 1/{}: {} ({}ns, WINNER)",
+                slot,
+                num_streams,
+                stream_id,
+                timestamp
             );
             
             // Add to results
-            self.results.push_back(result);
+            state.results.push_back(result);
             
             // Remove oldest if we exceed max_slots (only if not stopping at max)
-            if !self.stop_at_max && self.results.len() > self.max_slots {
-                self.results.pop_front();
+            if !self.stop_at_max && state.results.len() > self.max_slots {
+                state.results.pop_front();
             }
         }
         
         true // Continue processing
     }
 
-    pub fn print_summary(&self) {
-        info!("=== RACE SUMMARY ===");
-        info!("Total slots tracked: {}", self.results.len());
+    pub async fn print_summary(&self) {
+        let state = self.state.read().await;
         
-        if self.stream_names.is_empty() {
+        info!("=== RACE SUMMARY ===");
+        info!("Total slots tracked: {}", state.results.len());
+        
+        if state.stream_names.is_empty() {
             info!("No streams have reported yet");
             info!("==================");
             return;
         }
         
         // Calculate comprehensive metrics for all streams
-        let metrics = self.calculate_stream_metrics();
+        let metrics = self.calculate_stream_metrics(&state).await;
         
         // Count completed races
-        let completed_races = self.results.iter()
-            .filter(|r| r.finish_times.len() == self.stream_names.len())
+        let completed_races = state.results.iter()
+            .filter(|r| r.finish_times.len() == state.stream_names.len())
             .count();
         
-        info!("Completed races (all {} streams reported): {}", self.stream_names.len(), completed_races);
-        info!("Partial results included: {}", self.results.len() - completed_races);
+        info!("Completed races (all {} streams reported): {}", state.stream_names.len(), completed_races);
+        info!("Partial results included: {}", state.results.len() - completed_races);
         
         // Sort streams by median time behind (ascending - fastest first)
         let mut sorted_metrics = metrics;
@@ -162,15 +207,15 @@ impl Referee {
         info!("==================");
     }
     
-    fn calculate_stream_metrics(&self) -> Vec<StreamMetrics> {
+    async fn calculate_stream_metrics(&self, state: &RefereeState) -> Vec<StreamMetrics> {
         let mut metrics = Vec::new();
         
-        for stream_name in &self.stream_names {
+        for stream_name in &state.stream_names {
             let mut times_behind_winner_ns: Vec<u128> = Vec::new();
             let mut wins = 0;
             let mut races_participated = 0;
             
-            for result in &self.results {
+            for result in &state.results {
                 if let Some(&my_time) = result.finish_times.get(stream_name) {
                     races_participated += 1;
                     
@@ -210,9 +255,6 @@ impl Referee {
                 p99_time_behind_ms: p99,
             });
         }
-        
-        // Sort by median time behind (ascending - fastest first)
-        metrics.sort_by(|a, b| a.median_time_behind_ms.partial_cmp(&b.median_time_behind_ms).unwrap());
         
         metrics
     }
@@ -259,5 +301,5 @@ impl Referee {
     }
 }
 
-// Thread-safe wrapper for sharing between tasks
-pub type SharedReferee = Arc<Mutex<Referee>>;
+// Shared referee type - no longer needs Mutex!
+pub type SharedReferee = Arc<Referee>;

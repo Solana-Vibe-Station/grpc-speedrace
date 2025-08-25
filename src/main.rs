@@ -4,7 +4,6 @@ use futures::TryFutureExt;
 use tracing::{error, info};
 use tokio::task::JoinHandle;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::time::Instant;
 
 mod client;
@@ -16,7 +15,7 @@ mod referee;
 use client::GrpcClient;
 use config::{Config, StreamConfig};
 use subscription::SubscriptionManager;
-use referee::{Referee, SharedReferee};
+use referee::{Referee, SharedReferee, RaceEvent};
 
 // Shared clock reference for all streams - ensures consistent timing
 pub type SharedClock = Arc<Instant>;
@@ -33,16 +32,37 @@ async fn main() -> Result<()> {
         info!("Stream {}: {} - {}", i + 1, stream.name, stream.endpoint);
     }
     
-    // Create the referee with configuration from env
-    let referee: SharedReferee = Arc::new(Mutex::new(Referee::new(config.max_slots, config.stop_at_max)));
+    // Create the referee with event channel
+    let (referee, event_rx) = Referee::new(config.max_slots, config.stop_at_max);
     
     // Create a shared high-resolution clock reference
-    // All streams will measure time from this same starting point
     let shared_clock: SharedClock = Arc::new(Instant::now());
     
     info!("Race configuration:");
     info!("  Max slots: {}", config.max_slots);
     info!("  Stop at max: {}", config.stop_at_max);
+    
+    // Spawn the event processor that handles all race events in order
+    let processor_referee = referee.clone();
+    let event_processor_handle = tokio::spawn(async move {
+        let mut rx = event_rx;
+        
+        while let Some(event) = rx.recv().await {
+            match event {
+                RaceEvent::SlotReport { slot, stream_id, timestamp } => {
+                    let should_continue = processor_referee.process_slot_report(slot, stream_id, timestamp).await;
+                    
+                    // If race is complete, exit the entire program
+                    if !should_continue && processor_referee.is_complete().await {
+                        info!("Race complete! Maximum slots reached.");
+                        processor_referee.print_summary().await;
+                        std::process::exit(0);
+                    }
+                }
+            }
+        }
+        info!("Event processor shutting down");
+    });
     
     // Create subscription tasks for all streams
     let mut subscriptions: Vec<JoinHandle<Result<()>>> = Vec::new();
@@ -60,8 +80,12 @@ async fn main() -> Result<()> {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
-            let ref_guard = summary_referee.lock().await;
-            ref_guard.print_summary();
+            summary_referee.print_summary().await;
+            
+            // Check if race is complete
+            if summary_referee.is_complete().await {
+                break;
+            }
         }
     });
     
@@ -74,6 +98,9 @@ async fn main() -> Result<()> {
             error!("Stream {} task failed: {}", i + 1, e);
         }
     }
+    
+    // Wait for event processor to finish
+    let _ = event_processor_handle.await;
     
     Ok(())
 }
