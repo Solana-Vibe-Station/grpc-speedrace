@@ -27,7 +27,7 @@ gRPC SpeedRace subscribes to multiple Solana gRPC endpoints simultaneously and t
 ### Build from Source
 
 ```bash
-git clone https://github.com/yourusername/grpc_speedrace.git
+git clone https://github.com/Solana-Vibe-Station/grpc_speedrace.git
 cd grpc_speedrace
 cargo build --release
 ```
