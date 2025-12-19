@@ -37,31 +37,35 @@ pub enum RaceEvent {
 struct RefereeState {
     results: VecDeque<SlotResult>,
     stream_names: Vec<String>,
+    first_slot: Option<u64>,
 }
 
 pub struct Referee {
     max_slots: usize,
     stop_at_max: bool,
+    warmup_slots: usize,
     state: Arc<RwLock<RefereeState>>,
     event_tx: mpsc::UnboundedSender<RaceEvent>,
 }
 
 impl Referee {
-    pub fn new(max_slots: usize, stop_at_max: bool) -> (Arc<Self>, mpsc::UnboundedReceiver<RaceEvent>) {
+    pub fn new(max_slots: usize, stop_at_max: bool, warmup_slots: usize) -> (Arc<Self>, mpsc::UnboundedReceiver<RaceEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        
+
         let state = Arc::new(RwLock::new(RefereeState {
             results: VecDeque::with_capacity(max_slots),
             stream_names: Vec::new(),
+            first_slot: None,
         }));
-        
+
         let referee = Arc::new(Self {
             max_slots,
             stop_at_max,
+            warmup_slots,
             state,
             event_tx: tx,
         });
-        
+
         (referee, rx)
     }
     
@@ -78,7 +82,36 @@ impl Referee {
     // Process a slot report - called by the event processor
     pub async fn process_slot_report(&self, slot: u64, stream_id: String, timestamp: u128) -> bool {
         let mut state = self.state.write().await;
-        
+
+        // Track first slot seen for warmup calculation
+        if state.first_slot.is_none() {
+            state.first_slot = Some(slot);
+            info!("First slot seen: {}. Warmup period: {} slots (race starts at slot {})",
+                slot, self.warmup_slots, slot + self.warmup_slots as u64);
+        }
+
+        // Check if we're still in warmup period
+        let first_slot = state.first_slot.unwrap();
+        let race_start_slot = first_slot + self.warmup_slots as u64;
+        let is_warmup = slot < race_start_slot;
+
+        // Track unique stream names (even during warmup)
+        if !state.stream_names.contains(&stream_id) {
+            state.stream_names.push(stream_id.clone());
+        }
+
+        // During warmup, just log and skip counting
+        if is_warmup {
+            info!(
+                "[WARMUP] Slot {} - {} ({}ns) - {} slots until race starts",
+                slot,
+                stream_id,
+                timestamp,
+                race_start_slot - slot
+            );
+            return true;
+        }
+
         // If we're at max capacity and should stop, return false to signal completion
         if self.stop_at_max && state.results.len() >= self.max_slots {
             // Check if this is a new slot (not already in results)
@@ -86,25 +119,37 @@ impl Referee {
                 return false;
             }
         }
-        
-        // Track unique stream names
-        if !state.stream_names.contains(&stream_id) {
-            state.stream_names.push(stream_id.clone());
-        }
-        
+
         // Get the number of streams before we start borrowing results
         let num_streams = state.stream_names.len();
-        
+
         // Check if this slot already exists
         if let Some(existing) = state.results.iter_mut().find(|r| r.slot == slot) {
             // Add this stream's finish time
-            let position = existing.finish_times.len() + 1; // +1 because we haven't inserted yet
             existing.finish_times.insert(stream_id.clone(), timestamp);
-            
+
+            // Check if this stream actually had a faster timestamp than current winner
+            if timestamp < existing.winner_timestamp {
+                let old_winner = existing.winner.clone();
+                existing.winner = stream_id.clone();
+                existing.winner_timestamp = timestamp;
+                info!(
+                    "Slot {} - {} arrived later but had faster timestamp! New winner (was {})",
+                    slot,
+                    stream_id,
+                    old_winner
+                );
+            }
+
+            // Calculate position based on sorted timestamps
+            let mut times: Vec<_> = existing.finish_times.iter().collect();
+            times.sort_by_key(|(_, t)| **t);
+            let position = times.iter().position(|(name, _)| *name == &stream_id).unwrap() + 1;
+
             // Calculate time behind winner
             let time_behind_ns = timestamp.saturating_sub(existing.winner_timestamp);
             let time_behind_ms = time_behind_ns as f64 / 1_000_000.0;
-            
+
             // Unified logging format
             info!(
                 "Slot {} - Position {}/{}: {} ({}ns, +{:.3}ms)",
@@ -115,47 +160,49 @@ impl Referee {
                 timestamp,
                 time_behind_ms
             );
-            
+
             // If all streams have reported, log race completion
             if existing.finish_times.len() == num_streams {
+                let slowest_time = existing.finish_times.values().max().unwrap_or(&timestamp);
+                let spread_ms = (*slowest_time - existing.winner_timestamp) as f64 / 1_000_000.0;
                 info!(
                     "Slot {} race complete! All {} streams reported. Winner: {} ({:.3}ms ahead of last)",
                     slot,
                     num_streams,
                     existing.winner,
-                    time_behind_ms
+                    spread_ms
                 );
             }
         } else {
-            // This is the first report for this slot (winner)
+            // This is the first report for this slot (current winner)
             let mut finish_times = HashMap::new();
             finish_times.insert(stream_id.clone(), timestamp);
-            
+
             let result = SlotResult {
                 slot,
                 winner: stream_id.clone(),
                 winner_timestamp: timestamp,
                 finish_times,
             };
-            
-            // Unified logging format for winner
+
+            // Unified logging format for first reporter
             info!(
-                "Slot {} - Position 1/{}: {} ({}ns, WINNER)",
+                "Slot {} - Position 1/{}: {} ({}ns, FIRST)",
                 slot,
                 num_streams,
                 stream_id,
                 timestamp
             );
-            
+
             // Add to results
             state.results.push_back(result);
-            
+
             // Remove oldest if we exceed max_slots (only if not stopping at max)
             if !self.stop_at_max && state.results.len() > self.max_slots {
                 state.results.pop_front();
             }
         }
-        
+
         true // Continue processing
     }
 

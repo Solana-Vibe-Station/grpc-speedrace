@@ -16,6 +16,7 @@ use client::GrpcClient;
 use config::{Config, StreamConfig};
 use subscription::SubscriptionManager;
 use referee::{Referee, SharedReferee, RaceEvent};
+use yellowstone_grpc_proto::prelude::CommitmentLevel;
 
 // Shared clock reference for all streams - ensures consistent timing
 pub type SharedClock = Arc<Instant>;
@@ -33,14 +34,18 @@ async fn main() -> Result<()> {
     }
     
     // Create the referee with event channel
-    let (referee, event_rx) = Referee::new(config.max_slots, config.stop_at_max);
+    let (referee, event_rx) = Referee::new(config.max_slots, config.stop_at_max, config.warmup_slots);
     
     // Create a shared high-resolution clock reference
     let shared_clock: SharedClock = Arc::new(Instant::now());
     
+    let commitment = config.commitment_level()?;
+
     info!("Race configuration:");
     info!("  Max slots: {}", config.max_slots);
     info!("  Stop at max: {}", config.stop_at_max);
+    info!("  Commitment level: {}", config.commitment);
+    info!("  Warmup slots: {}", config.warmup_slots);
     
     // Spawn the event processor that handles all race events in order
     let processor_referee = referee.clone();
@@ -70,7 +75,7 @@ async fn main() -> Result<()> {
     for stream_config in config.streams {
         let referee_clone = referee.clone();
         let clock_clone = shared_clock.clone();
-        let subscription = tokio::spawn(run_subscription(stream_config, referee_clone, clock_clone));
+        let subscription = tokio::spawn(run_subscription(stream_config, referee_clone, clock_clone, commitment));
         subscriptions.push(subscription);
     }
     
@@ -105,32 +110,32 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_subscription(config: StreamConfig, referee: SharedReferee, clock: SharedClock) -> Result<()> {
+async fn run_subscription(config: StreamConfig, referee: SharedReferee, clock: SharedClock, commitment: CommitmentLevel) -> Result<()> {
     retry(ExponentialBackoff::default(), move || {
         let config = config.clone();
         let stream_name = config.name.clone();
         let stream_name_for_error = stream_name.clone();
         let referee = referee.clone();
         let clock = clock.clone();
-        
+
         async move {
             info!("[{}] Connecting to gRPC endpoint: {}", stream_name, config.endpoint);
-            
+
             // Create client
             let client = GrpcClient::new(config)
                 .connect()
                 .await
                 .map_err(|e| backoff::Error::transient(e))?;
-                
+
             info!("[{}] Successfully connected to Yellowstone gRPC", stream_name);
-            
+
             // Run the subscription with shared clock
-            let mut subscription_manager = SubscriptionManager::new(client, stream_name.clone(), referee, clock);
+            let mut subscription_manager = SubscriptionManager::new(client, stream_name.clone(), referee, clock, commitment);
             subscription_manager
                 .run()
                 .await
                 .map_err(|e| backoff::Error::transient(e))?;
-                
+
             Ok::<(), backoff::Error<anyhow::Error>>(())
         }
         .inspect_err(move |error| error!("[{}] Connection failed, will retry: {error}", stream_name_for_error))

@@ -1,6 +1,12 @@
 # Race configuration
-max_slots = 3000
+max_slots = 100
 stop_at_max = true
+
+# commitment level: processed (default), confirmed, or finalized
+commitment = "processed"
+
+# warmup slots to skip before counting winners (allows all streams to connect and stabilize before the race starts)
+warmup_slots = 10
 
 # Stream configurations as a list
 streams = [

@@ -14,15 +14,17 @@ pub struct SubscriptionManager<T: tonic::service::Interceptor> {
     handler: MessageHandler,
     stream_id: String,
     shared_clock: SharedClock,
+    commitment: CommitmentLevel,
 }
 
 impl<T: tonic::service::Interceptor> SubscriptionManager<T> {
-    pub fn new(client: GeyserGrpcClient<T>, stream_id: String, referee: SharedReferee, shared_clock: SharedClock) -> Self {
+    pub fn new(client: GeyserGrpcClient<T>, stream_id: String, referee: SharedReferee, shared_clock: SharedClock, commitment: CommitmentLevel) -> Self {
         Self {
             client,
             handler: MessageHandler::new(stream_id.clone(), referee),
             stream_id,
             shared_clock,
+            commitment,
         }
     }
 
@@ -35,7 +37,7 @@ impl<T: tonic::service::Interceptor> SubscriptionManager<T> {
                     interslot_updates: Some(false),
                 })
             ]),
-            commitment: Some(CommitmentLevel::Confirmed as i32),
+            commitment: Some(self.commitment as i32),
             ..Default::default()
         };
         
